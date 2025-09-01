@@ -2,11 +2,12 @@ pipeline {
     agent { label 'JNode' }
 
     environment {
-        APP_NAME    = "crm"
-        RELEASE     = "1.0.0"
-        DOCKER_USER = "maheshlokku1999"
-        IMAGE_TAG   = "${RELEASE}-${BUILD_NUMBER}"
-        CONTAINER_NAME = 'hubstr' // This is your Azure blob container name
+        APP_NAME        = 'crm'
+        RELEASE         = '1.0.0'
+        DOCKER_USER     = 'maheshlokku1999'
+        IMAGE_TAG       = "${RELEASE}-${BUILD_NUMBER}"
+        BUILD_ARCHIVE   = "build-${BUILD_NUMBER}.zip"
+        CONTAINER_NAME  = 'hubctr' // Azure Blob container name
     }
 
     tools {
@@ -14,6 +15,7 @@ pipeline {
     }
 
     stages {
+
         stage('Checkout') {
             steps {
                 checkout([
@@ -31,10 +33,9 @@ pipeline {
             steps {
                 dir('apps/web') {
                     sh '''
-                        rm -rf node_modules package-lock.json
+                        rm -rf node_modules package-lock.json .next dist out build
                         npm cache verify
                         npm cache clean --force
-                        rm -rf .next dist out build
                         npm install
 
                         echo " Installing dev dependencies..."
@@ -67,7 +68,8 @@ pipeline {
                               NEXTAUTH_URL=$NEXTAUTH_URL
                               EMAIL_USER=$EMAIL_USER
                               EMAIL_PASSWORD=$EMAIL_PASSWORD
-                          EOF
+                            EOF
+
                             echo " Building the frontend..."
                             npm run build
                         '''
@@ -104,15 +106,9 @@ pipeline {
             }
         }
 
-        stage('Upload Metadata to Azure Blob Storage') {
+        stage('Generate Metadata & Upload to Azure') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'azrstact', // 🔐 This must be created in Jenkins credentials
-                        usernameVariable: 'AZURE_ACCOUNT',
-                        passwordVariable: 'AZURE_KEY'
-                    )
-                ]) {
+                withCredentials([usernamePassword(credentialsId:'azrstact', usernameVariable: 'AZURE_ACCOUNT', passwordVariable: 'AZURE_KEY')]) {
                     script {
                         def metadata = """
                         {
@@ -125,16 +121,33 @@ pipeline {
 
                         writeFile file: 'metadata.json', text: metadata
 
-                        // Upload metadata file to Azure Blob Storage
                         sh '''
                         az storage blob upload \
                             --account-name "$AZURE_ACCOUNT" \
                             --account-key "$AZURE_KEY" \
-                            --container-name "hubctr" \
+                            --container-name "$CONTAINER_NAME" \
                             --file metadata.json \
-                            --name metadata-${BUILD_NUMBER}.json
+                            --name "metadata/metadata-${BUILD_NUMBER}.json"
                         '''
                     }
+                }
+            }
+        }
+
+        stage('Compress & Upload Project Archive') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'azrstact', usernameVariable: 'AZURE_ACCOUNT', passwordVariable: 'AZURE_KEY')]) {
+                    sh '''
+                        sudo apt update && sudo apt install zip -y
+                        zip -r ${BUILD_ARCHIVE} . -x '*.git*' -x 'node_modules/*' -x '*.DS_Store'
+
+                        az storage blob upload \
+                            --account-name "$AZURE_ACCOUNT" \
+                            --account-key "$AZURE_KEY" \
+                            --container-name "$CONTAINER_NAME" \
+                            --file "${BUILD_ARCHIVE}" \
+                            --name "archives/${APP_NAME}/${BUILD_ARCHIVE}"
+                    '''
                 }
             }
         }
@@ -142,10 +155,10 @@ pipeline {
 
     post {
         success {
-            echo " Successfully built and pushed Docker images, and uploaded metadata to Azure Storage."
+            echo " Build, Docker push, metadata upload, and project archive upload succeeded."
         }
         failure {
-            echo " Build failed. Check logs for details."
+            echo " Build or upload failed. Please check logs."
         }
     }
 }
