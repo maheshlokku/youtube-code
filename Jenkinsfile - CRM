@@ -4,10 +4,12 @@ pipeline {
     environment {
         APP_NAME        = 'crm'
         RELEASE         = '1.0.0'
-        DOCKER_USER     = 'maheshlokku1999'
         IMAGE_TAG       = "${RELEASE}-${BUILD_NUMBER}"
-        BUILD_ARCHIVE   = "build-${BUILD_NUMBER}.zip"
-        CONTAINER_NAME  = 'hubctr' // Azure Blob container name
+        ACR_REGISTRY    = 'sixz23.azurecr.io'
+        FRONTEND_PATH   = 'apps/web'
+        BACKEND_PATH    = 'apps/api'
+        FRONTEND_IMAGE  = "${ACR_REGISTRY}/${APP_NAME}-frontend"
+        BACKEND_IMAGE   = "${ACR_REGISTRY}/${APP_NAME}-backend"
     }
 
     tools {
@@ -31,8 +33,9 @@ pipeline {
 
         stage('Install Frontend Dependencies') {
             steps {
-                dir('apps/web') {
+                dir("${FRONTEND_PATH}") {
                     sh '''
+                        echo " Cleaning existing frontend artifacts and caches..."
                         rm -rf node_modules package-lock.json .next dist out build
                         npm cache verify
                         npm cache clean --force
@@ -40,7 +43,9 @@ pipeline {
 
                         echo " Installing dev dependencies..."
                         npm install tr46@0.0.3 --save-exact
+                        npm install dataloader && npm install ioredis
                         npm install --save-dev @types/jsonwebtoken @types/cookie-parser
+                        npm install @nestjs/common @nestjs/core @nestjs/graphql @nestjs/apollo @nestjs/config
                         rm -f node_modules/tr46/lib/mappingTable.json
                     '''
                 }
@@ -57,7 +62,7 @@ pipeline {
                     string(credentialsId: 'EMAIL_USER', variable: 'EMAIL_USER'),
                     string(credentialsId: 'EMAIL_PASSWORD', variable: 'EMAIL_PASSWORD')
                 ]) {
-                    dir('apps/web') {
+                    dir("${FRONTEND_PATH}") {
                         sh '''
                             echo " Writing environment variables to .env file..."
                             cat <<EOF > .env
@@ -78,87 +83,92 @@ pipeline {
             }
         }
 
+        stage('Login to ACR') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'Acr-credentials',
+                    usernameVariable: 'ACR_USERNAME',
+                    passwordVariable: 'ACR_PASSWORD'
+                )]) {
+                    sh '''
+                        echo $ACR_PASSWORD | docker login ${ACR_REGISTRY} -u $ACR_USERNAME --password-stdin
+                    '''
+                }
+            }
+        }
+
         stage('Build & Push Frontend Image') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'docker-token', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
-                    script {
-                        docker.withRegistry('https://index.docker.io/v1/', 'docker-token') {
-                            def feImage = docker.build("${DOCKER_USER}/${APP_NAME}-frontend:${IMAGE_TAG}", "-f apps/web/Dockerfile .")
-                            feImage.push()
-                            feImage.push("latest")
-                        }
-                    }
+                script {
+                    def imageNameWithTag = "${FRONTEND_IMAGE}:${IMAGE_TAG}"
+                    sh """
+                        docker build -t ${imageNameWithTag} -f ${FRONTEND_PATH}/Dockerfile .
+                        docker push ${imageNameWithTag}
+                        docker tag ${imageNameWithTag} ${FRONTEND_IMAGE}:latest
+                        docker push ${FRONTEND_IMAGE}:latest
+                    """
                 }
             }
         }
 
         stage('Build & Push Backend Image') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'docker-token', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
-                    script {
-                        docker.withRegistry('https://index.docker.io/v1/', 'docker-token') {
-                            def beImage = docker.build("${DOCKER_USER}/${APP_NAME}-backend:${IMAGE_TAG}", "-f apps/api/Dockerfile .")
-                            beImage.push()
-                            beImage.push("latest")
-                        }
-                    }
+                script {
+                    def imageNameWithTag = "${BACKEND_IMAGE}:${IMAGE_TAG}"
+                    sh """
+                        docker build -t ${imageNameWithTag} -f ${BACKEND_PATH}/Dockerfile .
+                        docker push ${imageNameWithTag}
+                        docker tag ${imageNameWithTag} ${BACKEND_IMAGE}:latest
+                        docker push ${BACKEND_IMAGE}:latest
+                    """
                 }
             }
         }
 
-        stage('Generate Metadata & Upload to Azure') {
+        stage('Cleanup Workspace & Docker') {
             steps {
-                withCredentials([usernamePassword(credentialsId:'azrstact', usernameVariable: 'AZURE_ACCOUNT', passwordVariable: 'AZURE_KEY')]) {
-                    script {
-                        def metadata = """
-                        {
-                            "frontendImage": "${DOCKER_USER}/${APP_NAME}-frontend:${IMAGE_TAG}",
-                            "backendImage": "${DOCKER_USER}/${APP_NAME}-backend:${IMAGE_TAG}",
-                            "buildNumber": "${BUILD_NUMBER}",
-                            "timestamp": "${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'", TimeZone.getTimeZone('UTC'))}"
-                        }
-                        """.stripIndent()
+                sh '''
+                    echo "Running workspace and Docker cleanup..."
 
-                        writeFile file: 'metadata.json', text: metadata
+                    # Clean frontend build artifacts
+                    rm -rf ${FRONTEND_PATH}/node_modules ${FRONTEND_PATH}/.next ${FRONTEND_PATH}/dist ${FRONTEND_PATH}/out ${FRONTEND_PATH}/build
 
-                        sh '''
-                        az storage blob upload \
-                            --account-name "$AZURE_ACCOUNT" \
-                            --account-key "$AZURE_KEY" \
-                            --container-name "$CONTAINER_NAME" \
-                            --file metadata.json \
-                            --name "metadata/metadata-${BUILD_NUMBER}.json"
-                        '''
-                    }
-                }
-            }
-        }
+                    # Clean npm cache
+                    npm cache clean --force
 
-        stage('Compress & Upload Project Archive') {
-            steps {
-                withCredentials([usernamePassword(credentialsId: 'azrstact', usernameVariable: 'AZURE_ACCOUNT', passwordVariable: 'AZURE_KEY')]) {
-                    sh '''
-                        sudo apt update && sudo apt install zip -y
-                        zip -r ${BUILD_ARCHIVE} . -x '*.git*' -x 'node_modules/*' -x '*.DS_Store'
+                    # Remove unused containers, networks, images (dangling + unused), and build cache
+                    docker system prune -a -f
+                    # Remove unused volumes (optional, can be skipped if volumes are needed)
+                    docker volume prune -f
+                    # Clean npm cache
+                    npm cache clean --force || true
 
-                        az storage blob upload \
-                            --account-name "$AZURE_ACCOUNT" \
-                            --account-key "$AZURE_KEY" \
-                            --container-name "$CONTAINER_NAME" \
-                            --file "${BUILD_ARCHIVE}" \
-                            --name "archives/${APP_NAME}/${BUILD_ARCHIVE}"
-                    '''
-                }
+                    # Clean Jenkins workspace folders (except for essential files)
+                    find . -name "node_modules" -type d -prune -exec rm -rf '{}' +
+
+                    # Clean build artifacts if present
+                    rm -rf */.next */dist */build */out
+
+                   echo "  complete. Disk usage after cleanup:"
+                   df -h /
+
+                    # Clean APT and system logs
+                    sudo apt-get clean
+                    sudo journalctl --vacuum-time=3d || true
+                    sudo rm -rf /var/log/*.gz /var/log/*.1 || true
+
+                    echo "Cleanup completed."
+                '''
             }
         }
     }
 
     post {
         success {
-            echo " Build, Docker push, metadata upload, and project archive upload succeeded."
+            echo " Frontend and Backend images pushed successfully to ACR. Cleanup complete."
         }
         failure {
-            echo " Build or upload failed. Please check logs."
+            echo " Build or push failed. Check logs."
         }
     }
 }
