@@ -1,5 +1,5 @@
 pipeline {
-    agent { label 'JNode' }
+    agent { label 'JAgent-Node' }
 
     environment {
         // App metadata
@@ -15,13 +15,13 @@ pipeline {
         BACKEND_DH_IMAGE   = "${DOCKERHUB_USERNAME}/${APP_NAME}-backend"
 
         // ACR details
-        ACR_REGISTRY     = 'sixz23.azurecr.io'
+        ACR_REGISTRY     = 'crmctrsy.azurecr.io'
         FRONTEND_ACR_IMG = "${ACR_REGISTRY}/${APP_NAME}-frontend"
         BACKEND_ACR_IMG  = "${ACR_REGISTRY}/${APP_NAME}-backend"
 
         // Azure Blob Storage
-        STORAGE_ACCOUNT  = 'hubstc'
-        CONTAINER_NAME   = 'hubctr'
+        STORAGE_ACCOUNT  = 'crmstr'
+        CONTAINER_NAME   = 'crmctr'
         ARCHIVE_NAME     = 'crm.zip'
     }
 
@@ -47,8 +47,18 @@ pipeline {
         stage('Compress Project for Blob Storage') {
             steps {
                 sh '''
-                    echo "Zipping project files..."
-                    zip -r ${ARCHIVE_NAME} . -x '*.git*' 'node_modules/*' '*.DS_Store'
+                    echo "Installing Azure CLI if not installed..."
+                    if ! command -v az &> /dev/null; then
+                    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                  else
+                    echo "Azure CLI already installed."
+                  fi
+                
+                   echo "Installing zip if not already installed..."
+                   sudo apt-get update && sudo apt-get install -y zip
+                    
+                   echo "Zipping project files..."
+                   zip -r ${ARCHIVE_NAME} . -x '*.git*' 'node_modules/*' '*.DS_Store'
                 '''
             }
         }
@@ -127,7 +137,7 @@ pipeline {
         stage('Login to DockerHub') {
             steps {
                 withCredentials([usernamePassword(
-                    credentialsId: 'docker-token',
+                    credentialsId: 'dockerhub-token',
                     usernameVariable: 'DOCKERHUB_USERNAME',
                     passwordVariable: 'DOCKERHUB_PASSWORD'
                 )]) {
@@ -142,7 +152,7 @@ pipeline {
         stage('Build & Push to DockerHub') {
             steps {
                 script {
-                    sh """
+                    sh '''
                         echo "Building and pushing frontend image to DockerHub..."
                         docker build -t ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} -f ${FRONTEND_PATH}/Dockerfile .
                         docker push ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
@@ -154,7 +164,7 @@ pipeline {
                         docker push ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
                         docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_DH_IMAGE}:latest
                         docker push ${BACKEND_DH_IMAGE}:latest
-                    """
+                    '''
                 }
             }
         }
@@ -177,7 +187,7 @@ pipeline {
         stage('Pull from DockerHub and Push to ACR') {
             steps {
                 script {
-                    sh """
+                    sh '''
                         echo "Pulling frontend image from DockerHub and pushing to ACR..."
                         docker pull ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
                         docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
@@ -191,7 +201,7 @@ pipeline {
                         docker push ${BACKEND_ACR_IMG}:${IMAGE_TAG}
                         docker tag ${BACKEND_ACR_IMG}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:latest
                         docker push ${BACKEND_ACR_IMG}:latest
-                    """
+                    '''
                 }
             }
         }
