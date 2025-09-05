@@ -1,0 +1,87 @@
+# Backend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crm-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend-app
+  template:
+    metadata:
+      labels:
+        app: backend-app
+    spec:
+      containers:
+      - name: backend-container
+        image: maheshlokku1999/crm-backend:latest
+        ports:
+        - containerPort: 4000
+        env:
+        - name: PORT
+          value: "4000"
+
+---
+
+# -----------------------------------
+# Backend Service
+# -----------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  selector:
+    app: backend-app
+  type: ClusterIP
+  ports:
+  - protocol: TCP
+    port: 4000
+    targetPort: 4000
+
+---
+
+# -----------------------------------
+# Frontend Deployment
+# -----------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend-app
+  template:
+    metadata:
+      labels:
+        app: frontend-app
+    spec:
+      containers:
+      - name: frontend-container
+        image: maheshlokku1999/crm-frontend:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: BACKEND_URL
+          value: http://backend-service:4000
+
+---
+
+# -----------------------------------
+# Frontend Service
+# -----------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+spec:
+  selector:
+    app: frontend-app
+  type: LoadBalancer
+  ports:
+  - protocol: TCP
+    port: 80         # Exposed to the internet
+    targetPort: 3000 # The port inside the frontend container
