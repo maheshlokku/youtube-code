@@ -9,12 +9,12 @@ pipeline {
         FRONTEND_PATH   = 'apps/web'
         BACKEND_PATH    = 'apps/api'
 
-        // DockerHub details
+        // DockerHub
         DOCKERHUB_USERNAME = 'maheshlokku1999'
         FRONTEND_DH_IMAGE  = "${DOCKERHUB_USERNAME}/${APP_NAME}-frontend"
         BACKEND_DH_IMAGE   = "${DOCKERHUB_USERNAME}/${APP_NAME}-backend"
 
-        // ACR details
+        // Azure Container Registry (ACR)
         ACR_REGISTRY     = 'crmctrsy.azurecr.io'
         FRONTEND_ACR_IMG = "${ACR_REGISTRY}/${APP_NAME}-frontend"
         BACKEND_ACR_IMG  = "${ACR_REGISTRY}/${APP_NAME}-backend"
@@ -23,6 +23,10 @@ pipeline {
         STORAGE_ACCOUNT  = 'crmstr'
         CONTAINER_NAME   = 'crmctr'
         ARCHIVE_NAME     = 'crm.zip'
+
+        // AKS
+        AKS_CLUSTER_NAME   = 'crm-clstr'
+        AKS_RESOURCE_GROUP = 'datavalley_resource_groups'
     }
 
     tools {
@@ -30,7 +34,6 @@ pipeline {
     }
 
     stages {
-
         stage('Checkout from GitHub') {
             steps {
                 checkout([
@@ -49,16 +52,16 @@ pipeline {
                 sh '''
                     echo "Installing Azure CLI if not installed..."
                     if ! command -v az &> /dev/null; then
-                    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-                  else
-                    echo "Azure CLI already installed."
-                  fi
-                
-                   echo "Installing zip if not already installed..."
-                   sudo apt-get update && sudo apt-get install -y zip
+                        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                    else
+                        echo "Azure CLI already installed."
+                    fi
                     
-                   echo "Zipping project files..."
-                   zip -r ${ARCHIVE_NAME} . -x '*.git*' 'node_modules/*' '*.DS_Store'
+                    echo "Installing zip if not already installed..."
+                    sudo apt-get update && sudo apt-get install -y zip
+                    
+                    echo "Zipping project files..."
+                    zip -r ${ARCHIVE_NAME} . -x '*.git*' 'node_modules/*' '*.DS_Store'
                 '''
             }
         }
@@ -90,16 +93,23 @@ pipeline {
             steps {
                 dir("${FRONTEND_PATH}") {
                     sh '''
-                        echo "Cleaning and installing frontend dependencies..."
+                        echo "Installing frontend dependencies..."
                         rm -rf node_modules package-lock.json .next dist out build
-                        npm cache verify
                         npm cache clean --force
                         npm install
-                        npm install tr46@0.0.3 --save-exact
-                        npm install dataloader ioredis
-                        npm install --save-dev @types/jsonwebtoken @types/cookie-parser
-                        npm install @nestjs/common @nestjs/core @nestjs/graphql @nestjs/apollo @nestjs/config
-                        rm -f node_modules/tr46/lib/mappingTable.json
+                    '''
+                }
+            }
+        }
+
+        stage('Install Backend Dependencies') {
+            steps {
+                dir("${BACKEND_PATH}") {
+                    sh '''
+                        echo "Installing backend dependencies..."
+                        rm -rf node_modules package-lock.json dist
+                        npm cache clean --force
+                        npm install
                     '''
                 }
             }
@@ -108,24 +118,36 @@ pipeline {
         stage('Build Frontend') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'NEXT_PUBLIC_SUPABASE_URL', variable: 'NEXT_PUBLIC_SUPABASE_URL'),
-                    string(credentialsId: 'NEXT_PUBLIC_SUPABASE_ANON_KEY', variable: 'NEXT_PUBLIC_SUPABASE_ANON_KEY'),
-                    string(credentialsId: 'NEXTAUTH_SECRET', variable: 'NEXTAUTH_SECRET'),
-                    string(credentialsId: 'NEXTAUTH_URL', variable: 'NEXTAUTH_URL'),
-                    string(credentialsId: 'EMAIL_USER', variable: 'EMAIL_USER'),
-                    string(credentialsId: 'EMAIL_PASSWORD', variable: 'EMAIL_PASSWORD')
+                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                    string(credentialsId: 'NEXTAUTH_SECRET', variable: 'NEXTAUTH_SECRET')
                 ]) {
                     dir("${FRONTEND_PATH}") {
                         sh '''
-                            echo "Writing .env file..."
+                            echo "Creating .env file for frontend..."
                             cat <<EOF > .env
-                              NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL
-                              NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY
-                              NEXT_PUBLIC_API_URL=http://localhost:4000/graphql
-                              NEXTAUTH_SECRET=$NEXTAUTH_SECRET
-                              NEXTAUTH_URL=$NEXTAUTH_URL
-                              EMAIL_USER=$EMAIL_USER
-                              EMAIL_PASSWORD=$EMAIL_PASSWORD
+                               NEXTAUTH_SECRET=$NEXTAUTH_SECRET
+                               NEXTAUTH_URL=http://localhost:3000
+                               NEON_DATABASE_URL=$NEON_DATABASE_URL
+                             EOF
+                            npm run build
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build Backend') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                    string(credentialsId: 'JWT_SECRET', variable: 'JWT_SECRET')
+                ]) {
+                    dir("${BACKEND_PATH}") {
+                        sh '''
+                            echo "Creating .env file for backend..."
+                            cat <<EOF > .env
+                               NEON_DATABASE_URL=$NEON_DATABASE_URL
+                               JWT_SECRET=$JWT_SECRET
                             EOF
                             npm run build
                         '''
@@ -149,23 +171,24 @@ pipeline {
             }
         }
 
-        stage('Build & Push to DockerHub') {
+        stage('Build & Push Images to DockerHub') {
             steps {
-                script {
-                    sh '''
-                        echo "Building and pushing frontend image to DockerHub..."
-                        docker build -t ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} -f ${FRONTEND_PATH}/Dockerfile .
-                        docker push ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
-                        docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_DH_IMAGE}:latest
-                        docker push ${FRONTEND_DH_IMAGE}:latest
+                sh '''
+                    echo "Building frontend Docker image..."
+                    docker build -t ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} -f ${FRONTEND_PATH}/Dockerfile .
 
-                        echo "Building and pushing backend image to DockerHub..."
-                        docker build -t ${BACKEND_DH_IMAGE}:${IMAGE_TAG} -f ${BACKEND_PATH}/Dockerfile .
-                        docker push ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
-                        docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_DH_IMAGE}:latest
-                        docker push ${BACKEND_DH_IMAGE}:latest
-                    '''
-                }
+                    echo "Building backend Docker image..."
+                    docker build -t ${BACKEND_DH_IMAGE}:${IMAGE_TAG} -f ${BACKEND_PATH}/Dockerfile .
+
+                    echo "Pushing images to DockerHub..."
+                    docker push ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
+                    docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_DH_IMAGE}:latest
+                    docker push ${FRONTEND_DH_IMAGE}:latest
+
+                    docker push ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
+                    docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_DH_IMAGE}:latest
+                    docker push ${BACKEND_DH_IMAGE}:latest
+                '''
             }
         }
 
@@ -184,53 +207,87 @@ pipeline {
             }
         }
 
-        stage('Pull from DockerHub and Push to ACR') {
+        stage('Push Docker Images to ACR') {
             steps {
-                script {
-                    sh '''
-                        echo "Pulling frontend image from DockerHub and pushing to ACR..."
-                        docker pull ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
-                        docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
-                        docker push ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
-                        docker tag ${FRONTEND_ACR_IMG}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:latest
-                        docker push ${FRONTEND_ACR_IMG}:latest
+                sh '''
+                    echo "Pushing frontend image to ACR..."
+                    docker pull ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
+                    docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
+                    docker push ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
+                    docker tag ${FRONTEND_ACR_IMG}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:latest
+                    docker push ${FRONTEND_ACR_IMG}:latest
 
-                        echo "Pulling backend image from DockerHub and pushing to ACR..."
-                        docker pull ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
-                        docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:${IMAGE_TAG}
-                        docker push ${BACKEND_ACR_IMG}:${IMAGE_TAG}
-                        docker tag ${BACKEND_ACR_IMG}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:latest
-                        docker push ${BACKEND_ACR_IMG}:latest
+                    echo "Pushing backend image to ACR..."
+                    docker pull ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
+                    docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:${IMAGE_TAG}
+                    docker push ${BACKEND_ACR_IMG}:${IMAGE_TAG}
+                    docker tag ${BACKEND_ACR_IMG}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:latest
+                    docker push ${BACKEND_ACR_IMG}:latest
+                '''
+            }
+        }
+
+        stage('Install kubectl and Azure CLI') {
+            steps {
+                sh '''
+                    echo "Installing Azure CLI if not already installed..."
+                    if ! command -v az &> /dev/null; then
+                        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                    else
+                        echo "Azure CLI is already installed."
+                    fi
+
+                    echo "Installing kubectl if not already installed..."
+                    if ! command -v kubectl &> /dev/null; then
+                        sudo az aks install-cli
+                    else
+                        echo "kubectl is already installed."
+                    fi
+                '''
+            }
+        }
+
+        stage('Deploy to AKS') {
+            steps {
+                withCredentials([azureServicePrincipal(
+                    credentialsId: 'azrstact',
+                    subscriptionIdVariable: 'AZ_SUBSCRIPTION_ID',
+                    clientIdVariable: 'AZ_CLIENT_ID',
+                    clientSecretVariable: 'AZ_CLIENT_SECRET',
+                    tenantIdVariable: 'AZ_TENANT_ID'
+                )]) {
+                    sh '''
+                        echo "Logging into Azure..."
+                        az login --service-principal \
+                            --username $AZ_CLIENT_ID \
+                            --password $AZ_CLIENT_SECRET \
+                            --tenant $AZ_TENANT_ID > /dev/null
+
+                        echo "Setting subscription..."
+                        az account set --subscription $AZ_SUBSCRIPTION_ID
+
+                        echo "Getting AKS credentials..."
+                        az aks get-credentials --resource-group ${AKS_RESOURCE_GROUP} --name ${AKS_CLUSTER_NAME} --overwrite-existing
+
+                        echo "Deploying each Kubernetes resource file individually..."
+                        kubectl apply -f k8s/frontend-deployment.yaml
+                        kubectl apply -f k8s/frontend-service.yaml
+                        kubectl apply -f k8s/backend-deployment.yaml
+                        kubectl apply -f k8s/backend-service.yaml
+
+                        echo "Deployment to AKS complete."
                     '''
                 }
             }
         }
 
-        stage('Cleanup Workspace & Docker') {
+        stage('Cleanup Docker') {
             steps {
                 sh '''
-                    echo "Performing cleanup..."
-                    rm -rf ${FRONTEND_PATH}/node_modules ${FRONTEND_PATH}/.next ${FRONTEND_PATH}/dist ${FRONTEND_PATH}/out ${FRONTEND_PATH}/build
-                    npm cache clean --force
-                    docker system prune -a -f
-                    docker volume prune -f
-                    find . -name "node_modules" -type d -prune -exec rm -rf '{}' +
-                    rm -rf */.next */dist */build */out
-                    df -h /
-                    sudo apt-get clean
-                    sudo journalctl --vacuum-time=3d || true
-                    sudo rm -rf /var/log/*.gz /var/log/*.1 || true
+                    echo "Cleaning up unused Docker resources..."
+                    docker system prune -af --volumes
                 '''
             }
-        }
-    }
-
-    post {
-        success {
-            echo " Build, push to DockerHub & ACR, and blob upload completed successfully."
-        }
-        failure {
-            echo " Build or push failed. Check logs for more info."
         }
     }
 }
