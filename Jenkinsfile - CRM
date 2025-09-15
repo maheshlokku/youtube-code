@@ -2,35 +2,38 @@ pipeline {
     agent { label 'JAgent-Node' }
 
     environment {
-        // App metadata
         APP_NAME        = 'crm'
         RELEASE         = '1.0.0'
         IMAGE_TAG       = "${RELEASE}-${BUILD_NUMBER}"
-        FRONTEND_PATH   = 'apps/web'
-        BACKEND_PATH    = 'apps/api'
+        FRONTEND_PATH   = 'crm'
+        BACKEND_PATH    = 'crm'
 
-        // DockerHub
         DOCKERHUB_USERNAME = 'maheshlokku1999'
         FRONTEND_DH_IMAGE  = "${DOCKERHUB_USERNAME}/${APP_NAME}-frontend"
         BACKEND_DH_IMAGE   = "${DOCKERHUB_USERNAME}/${APP_NAME}-backend"
 
-        // Azure Container Registry (ACR)
         ACR_REGISTRY     = 'crmctrsy.azurecr.io'
         FRONTEND_ACR_IMG = "${ACR_REGISTRY}/${APP_NAME}-frontend"
         BACKEND_ACR_IMG  = "${ACR_REGISTRY}/${APP_NAME}-backend"
 
-        // Azure Blob Storage
         STORAGE_ACCOUNT  = 'crmstr'
         CONTAINER_NAME   = 'crmctr'
         ARCHIVE_NAME     = 'crm.zip'
 
-        // AKS
         AKS_CLUSTER_NAME   = 'crm-clstr'
         AKS_RESOURCE_GROUP = 'datavalley_resource_groups'
+
+        // Enable Docker BuildKit
+        DOCKER_BUILDKIT = '1'
     }
 
     tools {
         nodejs 'Node18'
+    }
+
+    options {
+        timeout(time: 15, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
     stages {
@@ -41,7 +44,9 @@ pipeline {
                     branches: [[name: '*/main']],
                     userRemoteConfigs: [[
                         url: 'https://github.com/bytex-analytics/crm.git',
-                        credentialsId: 'github-token'
+                        credentialsId: 'github-token',
+                        shallow: true,
+                        depth: 1
                     ]]
                 ])
             }
@@ -53,13 +58,11 @@ pipeline {
                     echo "Installing Azure CLI if not installed..."
                     if ! command -v az &> /dev/null; then
                         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-                    else
-                        echo "Azure CLI already installed."
                     fi
-                    
-                    echo "Installing zip if not already installed..."
+
+                    echo "Installing zip..."
                     sudo apt-get update && sudo apt-get install -y zip
-                    
+
                     echo "Zipping project files..."
                     zip -r ${ARCHIVE_NAME} . -x '*.git*' 'node_modules/*' '*.DS_Store'
                 '''
@@ -70,7 +73,7 @@ pipeline {
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'azrstact',
+                        credentialsId: 'crmazrstact',
                         usernameVariable: 'AZURE_STORAGE_ACCOUNT',
                         passwordVariable: 'AZURE_STORAGE_KEY'
                     )
@@ -96,7 +99,7 @@ pipeline {
                         echo "Installing frontend dependencies..."
                         rm -rf node_modules package-lock.json .next dist out build
                         npm cache clean --force
-                        npm install
+                        npm ci
                     '''
                 }
             }
@@ -108,140 +111,94 @@ pipeline {
                     sh '''
                         echo "Installing backend dependencies..."
                         rm -rf node_modules package-lock.json dist
-                        npm cache clean --force
-                        npm install
+                        npm ci
                     '''
                 }
             }
         }
 
-        stage('Build Frontend') {
-            steps {
-                withCredentials([
-                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
-                    string(credentialsId: 'NEXTAUTH_SECRET', variable: 'NEXTAUTH_SECRET')
-                ]) {
-                    dir("${FRONTEND_PATH}") {
-                        sh '''
-                            echo "Creating .env file for frontend..."
-                            cat <<EOF > .env
-                               NEXTAUTH_SECRET=$NEXTAUTH_SECRET
-                               NEXTAUTH_URL=http://localhost:3000
-                               NEON_DATABASE_URL=$NEON_DATABASE_URL
-                             EOF
-                            npm run build
-                        '''
+        stage('Build & Push Docker Images') {
+            parallel {
+                stage('Backend Build & Push') {
+                    steps {
+                        withCredentials([
+                            string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                            string(credentialsId: 'JWT_SECRET', variable: 'JWT_SECRET'),
+                            usernamePassword(
+                                credentialsId: 'dockerhub-token',
+                                usernameVariable: 'DOCKERHUB_USERNAME',
+                                passwordVariable: 'DOCKERHUB_PASSWORD'
+                            )
+                        ]) {
+                            dir("${BACKEND_PATH}") {
+                                sh '''
+                                    echo "Creating .env file for backend..."
+                                    cat <<EOF > .env
+                                       NEON_DATABASE_URL=$NEON_DATABASE_URL
+                                       JWT_SECRET=$JWT_SECRET
+                                     EOF
+                                    npm run build
+                                    echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
+
+                                    docker build -t ${BACKEND_ACR_IMG}:${IMAGE_TAG} -f Dockerfile-api .
+                                    docker push ${BACKEND_ACR_IMG}:${IMAGE_TAG}
+                                    docker tag ${BACKEND_ACR_IMG}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:v1
+                                    docker push ${BACKEND_ACR_IMG}:v1
+
+                                    docker tag ${BACKEND_ACR_IMG}:${IMAGE_TAG} ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
+                                    docker push ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
+                                '''
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        stage('Build Backend') {
-            steps {
-                withCredentials([
-                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
-                    string(credentialsId: 'JWT_SECRET', variable: 'JWT_SECRET')
-                ]) {
-                    dir("${BACKEND_PATH}") {
-                        sh '''
-                            echo "Creating .env file for backend..."
-                            cat <<EOF > .env
-                               NEON_DATABASE_URL=$NEON_DATABASE_URL
-                               JWT_SECRET=$JWT_SECRET
-                            EOF
-                            npm run build
-                        '''
+                stage('Frontend Build & Push') {
+                    steps {
+                        withCredentials([
+                            string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                            string(credentialsId: 'NEXTAUTH_SECRET', variable: 'NEXTAUTH_SECRET'),
+                            usernamePassword(
+                                credentialsId: 'dockerhub-token',
+                                usernameVariable: 'DOCKERHUB_USERNAME',
+                                passwordVariable: 'DOCKERHUB_PASSWORD'
+                            )
+                        ]) {
+                            dir("${FRONTEND_PATH}") {
+                                sh '''
+                                    echo "Creating .env file for frontend..."
+                                    cat <<EOF > .env
+                                      NEXTAUTH_SECRET=$NEXTAUTH_SECRET
+                                      NEXTAUTH_URL=http://localhost:3000
+                                      NEON_DATABASE_URL=$NEON_DATABASE_URL
+                                    EOF
+                                    npm run build
+                                    echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
+
+                                    docker build -t ${FRONTEND_ACR_IMG}:${IMAGE_TAG} -f Dockerfile-web .
+                                    docker push ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
+                                    docker tag ${FRONTEND_ACR_IMG}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:v1
+                                    docker push ${FRONTEND_ACR_IMG}:v1
+
+                                    docker tag ${FRONTEND_ACR_IMG}:${IMAGE_TAG} ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
+                                    docker push ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
+                                '''
+                            }
+                        }
                     }
                 }
-            }
-        }
-
-        stage('Login to DockerHub') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-token',
-                    usernameVariable: 'DOCKERHUB_USERNAME',
-                    passwordVariable: 'DOCKERHUB_PASSWORD'
-                )]) {
-                    sh '''
-                        echo "Logging into DockerHub..."
-                        echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
-                    '''
-                }
-            }
-        }
-
-        stage('Build & Push Images to DockerHub') {
-            steps {
-                sh '''
-                    echo "Building frontend Docker image..."
-                    docker build -t ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} -f ${FRONTEND_PATH}/Dockerfile .
-
-                    echo "Building backend Docker image..."
-                    docker build -t ${BACKEND_DH_IMAGE}:${IMAGE_TAG} -f ${BACKEND_PATH}/Dockerfile .
-
-                    echo "Pushing images to DockerHub..."
-                    docker push ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
-                    docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_DH_IMAGE}:latest
-                    docker push ${FRONTEND_DH_IMAGE}:latest
-
-                    docker push ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
-                    docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_DH_IMAGE}:latest
-                    docker push ${BACKEND_DH_IMAGE}:latest
-                '''
-            }
-        }
-
-        stage('Login to Azure ACR') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'Acr-credentials',
-                    usernameVariable: 'ACR_USERNAME',
-                    passwordVariable: 'ACR_PASSWORD'
-                )]) {
-                    sh '''
-                        echo "Logging into Azure Container Registry..."
-                        echo $ACR_PASSWORD | docker login ${ACR_REGISTRY} -u $ACR_USERNAME --password-stdin
-                    '''
-                }
-            }
-        }
-
-        stage('Push Docker Images to ACR') {
-            steps {
-                sh '''
-                    echo "Pushing frontend image to ACR..."
-                    docker pull ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
-                    docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
-                    docker push ${FRONTEND_ACR_IMG}:${IMAGE_TAG}
-                    docker tag ${FRONTEND_ACR_IMG}:${IMAGE_TAG} ${FRONTEND_ACR_IMG}:latest
-                    docker push ${FRONTEND_ACR_IMG}:latest
-
-                    echo "Pushing backend image to ACR..."
-                    docker pull ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
-                    docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:${IMAGE_TAG}
-                    docker push ${BACKEND_ACR_IMG}:${IMAGE_TAG}
-                    docker tag ${BACKEND_ACR_IMG}:${IMAGE_TAG} ${BACKEND_ACR_IMG}:latest
-                    docker push ${BACKEND_ACR_IMG}:latest
-                '''
             }
         }
 
         stage('Install kubectl and Azure CLI') {
             steps {
                 sh '''
-                    echo "Installing Azure CLI if not already installed..."
                     if ! command -v az &> /dev/null; then
                         curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-                    else
-                        echo "Azure CLI is already installed."
                     fi
 
-                    echo "Installing kubectl if not already installed..."
                     if ! command -v kubectl &> /dev/null; then
                         sudo az aks install-cli
-                    else
-                        echo "kubectl is already installed."
                     fi
                 '''
             }
@@ -257,37 +214,51 @@ pipeline {
                     tenantIdVariable: 'AZ_TENANT_ID'
                 )]) {
                     sh '''
-                        echo "Logging into Azure..."
                         az login --service-principal \
                             --username $AZ_CLIENT_ID \
                             --password $AZ_CLIENT_SECRET \
                             --tenant $AZ_TENANT_ID > /dev/null
 
-                        echo "Setting subscription..."
                         az account set --subscription $AZ_SUBSCRIPTION_ID
-
-                        echo "Getting AKS credentials..."
                         az aks get-credentials --resource-group ${AKS_RESOURCE_GROUP} --name ${AKS_CLUSTER_NAME} --overwrite-existing
 
-                        echo "Deploying each Kubernetes resource file individually..."
-                        kubectl apply -f k8s/frontend-deployment.yaml
-                        kubectl apply -f k8s/frontend-service.yaml
-                        kubectl apply -f k8s/backend-deployment.yaml
+                        sed "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/backend-deployment.yaml | kubectl apply -f -
+                        sed "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/frontend-deployment.yaml | kubectl apply -f -
                         kubectl apply -f k8s/backend-service.yaml
-
-                        echo "Deployment to AKS complete."
+                        kubectl apply -f k8s/frontend-service.yaml
                     '''
                 }
             }
         }
 
-        stage('Cleanup Docker') {
+        stage('System Cleanup - Disk Space Management') {
             steps {
                 sh '''
-                    echo "Cleaning up unused Docker resources..."
-                    docker system prune -af --volumes
+                    echo "Disk usage before cleanup:"
+                    df -h
+
+                    echo "Cleaning /tmp and empty dirs..."
+                    sudo find /tmp -type f -atime +1 -delete || true
+                    sudo find /tmp -type d -empty -delete || true
+
+                    echo "Cleaning Jenkins workspace cache..."
+                    if [ -d /var/lib/jenkins/workspace/ ]; then
+                        sudo find /var/lib/jenkins/workspace/ -mindepth 1 -maxdepth 3 -exec rm -rf {} +
+                    else
+                        echo "Jenkins workspace directory does not exist, skipping cleanup."
+                    fi
+
+                    echo "Disk usage after cleanup:"
+                    df -h
                 '''
             }
+        }
+    }
+
+    post {
+        always {
+            echo 'Cleaning up Docker system...'
+            sh 'docker system prune -af --volumes || true'
         }
     }
 }
