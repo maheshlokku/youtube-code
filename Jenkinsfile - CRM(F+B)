@@ -1,0 +1,248 @@
+pipeline {
+    agent { label 'JAgent-Node' }
+
+    environment {
+        APP_NAME        = 'crm'
+        RELEASE         = '1.0.0'
+        IMAGE_TAG       = "${RELEASE}-${BUILD_NUMBER}"
+        FRONTEND_PATH   = 'crm'
+        BACKEND_PATH    = 'crm'
+
+        DOCKERHUB_USERNAME = 'maheshlokku1999'
+        FRONTEND_DH_IMAGE  = "${DOCKERHUB_USERNAME}/${APP_NAME}-frontend"
+        BACKEND_DH_IMAGE   = "${DOCKERHUB_USERNAME}/${APP_NAME}-backend"
+
+        AKS_CLUSTER_NAME   = 'crm-clstr'
+        AKS_RESOURCE_GROUP = 'datavalley_resource_groups'
+    }
+
+    tools {
+        nodejs 'Node20'
+    }
+
+    stages {
+        stage('Checkout from GitHub') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/bytex-analytics/crm.git',
+                        credentialsId: 'github-token'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Install Frontend Dependencies') {
+            steps {
+                dir("${FRONTEND_PATH}") {
+                    sh '''
+                        echo "Installing frontend dependencies..."
+                        rm -rf node_modules package-lock.json .next dist out build
+                        npm cache clean --force
+                        npm install
+                    '''
+                }
+            }
+        }
+
+        stage('Install Backend Dependencies') {
+            steps {
+                dir("${BACKEND_PATH}") {
+                    sh '''
+                        echo "Installing backend dependencies..."
+                        rm -rf node_modules package-lock.json dist
+                        npm install
+                    '''
+                }
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                    string(credentialsId: 'NEXTAUTH_SECRET', variable: 'NEXTAUTH_SECRET')
+                ]) {
+                    dir("${FRONTEND_PATH}") {
+                        sh '''
+                            echo "Creating .env file for frontend..."
+                            cat <<EOF > .env
+                               NEXTAUTH_SECRET=$NEXTAUTH_SECRET
+                               NEXTAUTH_URL=http://localhost:3000
+                               NEON_DATABASE_URL=$NEON_DATABASE_URL
+                            EOF
+                            npm run build
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build Backend') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                    string(credentialsId: 'JWT_SECRET', variable: 'JWT_SECRET')
+                ]) {
+                    dir("${BACKEND_PATH}") {
+                        sh '''
+                            echo "Creating .env file for backend..."
+                            cat <<EOF > .env
+                              NEON_DATABASE_URL=$NEON_DATABASE_URL
+                              JWT_SECRET=$JWT_SECRET
+                            EOF
+                            echo "Building backend..."
+                            npm run build
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Login to DockerHub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-token',
+                    usernameVariable: 'DOCKERHUB_USERNAME',
+                    passwordVariable: 'DOCKERHUB_PASSWORD'
+                )]) {
+                    sh '''
+                        echo "Logging into DockerHub..."
+                        echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Push Docker Images') {
+            steps {
+                sh '''
+                    echo "Building and pushing Backend image..."
+                    docker build -t ${BACKEND_DH_IMAGE}:${IMAGE_TAG} -f Dockerfile-api .
+                    docker push ${BACKEND_DH_IMAGE}:${IMAGE_TAG}
+                    docker tag ${BACKEND_DH_IMAGE}:${IMAGE_TAG} ${BACKEND_DH_IMAGE}:latest
+                    docker push ${BACKEND_DH_IMAGE}:latest
+
+                    echo "Building and pushing Frontend image..."
+                    docker build -t ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} -f Dockerfile-web .
+                    docker push ${FRONTEND_DH_IMAGE}:${IMAGE_TAG}
+                    docker tag ${FRONTEND_DH_IMAGE}:${IMAGE_TAG} ${FRONTEND_DH_IMAGE}:latest
+                    docker push ${FRONTEND_DH_IMAGE}:latest
+                '''
+            }
+        }
+
+        stage('Install kubectl and Azure CLI') {
+            steps {
+                sh '''
+                    if ! command -v az &> /dev/null; then
+                        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                    fi
+
+                    if ! command -v kubectl &> /dev/null; then
+                        sudo az aks install-cli
+                    fi
+                '''
+            }
+        }
+
+        stage('Update K8s Secret') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'NEON_DATABASE_URL', variable: 'NEON_DATABASE_URL'),
+                    string(credentialsId: 'JWT_SECRET', variable: 'JWT_SECRET')
+                ]) {
+                    sh '''
+                        echo "Updating Kubernetes secrets..."
+                        kubectl delete secret crm-secrets --ignore-not-found -n default
+                        kubectl create secret generic crm-secrets \
+                          --from-literal=NEON_DATABASE_URL="$NEON_DATABASE_URL" \
+                          --from-literal=JWT_SECRET="$JWT_SECRET" \
+                          --from-literal=EMAIL_USER="sairammaadu@gmail.com" \
+                          --from-literal=EMAIL_PASSWORD="xsklqttoervaplto" \
+                          -n default
+
+                        echo "Restarting backend deployment to apply new secrets..."
+                        kubectl rollout restart deployment crm-backend -n default
+                        kubectl rollout status deployment crm-backend -n default
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to AKS') {
+            steps {
+                withCredentials([azureServicePrincipal(
+                    credentialsId: 'azrstact',
+                    subscriptionIdVariable: 'AZ_SUBSCRIPTION_ID',
+                    clientIdVariable: 'AZ_CLIENT_ID',
+                    clientSecretVariable: 'AZ_CLIENT_SECRET',
+                    tenantIdVariable: 'AZ_TENANT_ID'
+                )]) {
+                    sh '''
+                        echo "Logging into Azure..."
+                        az login --service-principal \
+                            --username $AZ_CLIENT_ID \
+                            --password $AZ_CLIENT_SECRET \
+                            --tenant $AZ_TENANT_ID > /dev/null
+
+                        az account set --subscription $AZ_SUBSCRIPTION_ID
+                        az aks get-credentials --resource-group ${AKS_RESOURCE_GROUP} --name ${AKS_CLUSTER_NAME} --overwrite-existing
+
+                        echo "Deploying backend with IMAGE_TAG=${IMAGE_TAG}"
+                        sed "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/crm-backend-deployment.yaml | kubectl apply -f -
+
+                        echo "Deploying frontend with IMAGE_TAG=${IMAGE_TAG}"
+                        sed "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/crm-frontend-deployment.yaml | kubectl apply -f -
+
+                        kubectl apply -f k8s/crm-frontend-service.yaml
+                        kubectl apply -f k8s/crm-backend-service.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('Cleanup Docker') {
+            steps {
+                sh 'docker system prune -af --volumes || true'
+            }
+        }
+
+        stage('System Cleanup - Disk Space Management') {
+            steps {
+                sh '''
+                    echo "Disk usage before cleanup:"
+                    df -h
+
+                    echo "Cleaning /tmp and empty dirs..."
+                    sudo find /tmp -type f -atime +1 -delete || true
+                    sudo find /tmp -type d -empty -delete || true
+
+                    echo "Cleaning Jenkins workspace cache..."
+                    if [ -d /var/lib/jenkins/workspace/ ]; then
+                        sudo find /var/lib/jenkins/workspace/ -mindepth 1 -maxdepth 3 -exec rm -rf {} +
+                    else
+                        echo "Jenkins workspace directory does not exist, skipping cleanup."
+                    fi
+
+                    echo "Disk usage after cleanup:"
+                    df -h
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo " Pipeline completed successfully!"
+        }
+        failure {
+            echo " Pipeline failed. Please check logs."
+        }
+        always {
+            echo " Running final cleanup..."
+        }
+    }
+}
